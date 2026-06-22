@@ -107,8 +107,12 @@ class WorldScoreApp:
 		self.PreviewPhoto: ImageTk.PhotoImage | None = None
 		self.PreviewScale = 1.0
 
+		self.SettingsPath = pathlib.Path(__file__).resolve().with_name("settings.xml")
+
 		self._BuildGui()
-		self._GuessPrefabsFolder()
+		self._LoadSettings()
+		if not self.PrefabsFolder.get().strip():
+			self._GuessPrefabsFolder()
 
 	def _BuildGui(self):
 		Main = tkinter.ttk.Frame(self.Root, padding=8)
@@ -172,14 +176,45 @@ class WorldScoreApp:
 		Paned.add(InfoFrame, weight=2)
 
 	def _ChooseWorldFolder(self):
-		Folder = tkinter.filedialog.askdirectory(title="Select 7 Days to Die GeneratedWorlds/<World> folder")
+		Folder = tkinter.filedialog.askdirectory(
+			title="Select 7 Days to Die GeneratedWorlds/<World> folder",
+			initialdir=self.WorldFolder.get().strip() or None,
+		)
 		if Folder:
 			self.WorldFolder.set(Folder)
+			self._SaveSettings()
 
 	def _ChoosePrefabsFolder(self):
-		Folder = tkinter.filedialog.askdirectory(title="Select 7 Days to Die/Data/Prefabs folder")
+		Folder = tkinter.filedialog.askdirectory(
+			title="Select 7 Days to Die/Data/Prefabs folder",
+			initialdir=self.PrefabsFolder.get().strip() or None,
+		)
 		if Folder:
 			self.PrefabsFolder.set(Folder)
+			self._SaveSettings()
+
+	def _LoadSettings(self):
+		try:
+			Root = xml.etree.ElementTree.parse(self.SettingsPath).getroot()
+		except (FileNotFoundError, xml.etree.ElementTree.ParseError, OSError):
+			return
+		WorldFolder = Root.findtext("WorldFolder", default="").strip()
+		PrefabsFolder = Root.findtext("PrefabsFolder", default="").strip()
+		if WorldFolder:
+			self.WorldFolder.set(WorldFolder)
+		if PrefabsFolder:
+			self.PrefabsFolder.set(PrefabsFolder)
+
+	def _SaveSettings(self):
+		Root = xml.etree.ElementTree.Element("Settings")
+		xml.etree.ElementTree.SubElement(Root, "WorldFolder").text = self.WorldFolder.get().strip()
+		xml.etree.ElementTree.SubElement(Root, "PrefabsFolder").text = self.PrefabsFolder.get().strip()
+		Tree = xml.etree.ElementTree.ElementTree(Root)
+		try:
+			xml.etree.ElementTree.indent(Tree, space="	")
+		except AttributeError:
+			pass
+		Tree.write(self.SettingsPath, encoding="utf-8", xml_declaration=True)
 
 	def _GuessPrefabsFolder(self):
 		Candidates = [
@@ -239,7 +274,10 @@ class WorldScoreApp:
 
 			self.Placements = [P for P in Placements if P.InMap]
 			self.Traders = [P for P in self.Placements if P.IsTrader]
-			self.ScorePrefabs = self._FilterScorePrefabs(self.Placements)
+			self.ScorePrefabs, FilteredPrefabs = self._FilterScorePrefabs(Placements)
+			FilteredLogPath = WorldPath / "poi_filtered.log"
+			WriteFilteredPoiLog(FilteredLogPath, FilteredPrefabs)
+			self._SaveSettings()
 
 			self._SetStatus("Computing score heatmap...")
 			self.Score = ComputeScoreMap(
@@ -272,24 +310,18 @@ class WorldScoreApp:
 			tkinter.messagebox.showerror("7DTD world POI score map", str(Error), parent=self.Root)
 			self._SetStatus(f"Error: {Error}")
 
-	def _FilterScorePrefabs(self, Placements: list[PrefabPlacement]) -> list[PrefabPlacement]:
+	def _FilterScorePrefabs(self, Placements: list[PrefabPlacement]) -> tuple[list[PrefabPlacement], list[tuple[PrefabPlacement, str]]]:
 		MinTier = int(self.MinTier.get())
 		Strict = bool(self.StrictTierComparison.get())
 		Result = []
+		Filtered = []
 		for Placement in Placements:
-			if Placement.IsTrader:
-				continue
-			if Placement.Tier is None:
-				continue
-			if IsExcludedPrefabName(Placement.Name):
-				continue
-			if Strict:
-				if Placement.Tier > MinTier:
-					Result.append(Placement)
+			Reason = GetScorePrefabExclusionReason(Placement, MinTier, Strict)
+			if Reason is None:
+				Result.append(Placement)
 			else:
-				if Placement.Tier >= MinTier:
-					Result.append(Placement)
-		return Result
+				Filtered.append((Placement, Reason))
+		return Result, Filtered
 
 	def _ShowPreview(self):
 		if self.RenderImage is None:
@@ -411,6 +443,41 @@ def ParseWorldPrefabs(PrefabsXmlPath: pathlib.Path) -> list[PrefabPlacement]:
 		Placements.append(Placement)
 	return Placements
 
+
+
+def GetScorePrefabExclusionReason(Placement: PrefabPlacement, MinTier: int, Strict: bool) -> str | None:
+	if not Placement.InMap:
+		return "outside map bounds after coordinate transform"
+	if Placement.IsTrader:
+		return "trader prefab is used only for trader distance scoring"
+	if Placement.Tier is None:
+		return "missing DifficultyTier/quest tier"
+	if IsExcludedPrefabName(Placement.Name):
+		return "name matches excluded part/tile/decoration pattern"
+	if Strict:
+		if Placement.Tier <= MinTier:
+			return f"tier {Placement.Tier} is not greater than minimum tier {MinTier}"
+	else:
+		if Placement.Tier < MinTier:
+			return f"tier {Placement.Tier} is less than minimum tier {MinTier}"
+	return None
+
+
+def WriteFilteredPoiLog(LogPath: pathlib.Path, FilteredPrefabs: list[tuple[PrefabPlacement, str]]):
+	with LogPath.open("w", encoding="utf-8", newline="") as LogFile:
+		LogFile.write("Filtered POIs\n")
+		LogFile.write("=============" + "\n")
+		LogFile.write(f"Total filtered: {len(FilteredPrefabs)}\n\n")
+		for Placement, Reason in sorted(FilteredPrefabs, key=lambda Item: (Item[1], Item[0].Name, Item[0].WorldX, Item[0].WorldZ)):
+			TierText = "unknown" if Placement.Tier is None else str(Placement.Tier)
+			LogFile.write(
+				f"Reason: {Reason} | "
+				f"Name: {Placement.Name} | "
+				f"Tier: {TierText} ({Placement.TierSource}) | "
+				f"World: E/W {Placement.WorldX:.2f}, Alt {Placement.WorldY:.2f}, N/S {Placement.WorldZ:.2f} | "
+				f"Pixel: {Placement.PixelX}, {Placement.PixelY} | "
+				f"InMap: {Placement.InMap}\n"
+			)
 
 def FindFirstAttribute(Attrs: dict[str, str], Keys: list[str]) -> str | None:
 	LowerToOriginal = {Key.lower(): Key for Key in Attrs.keys()}
