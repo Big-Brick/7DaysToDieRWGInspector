@@ -324,7 +324,7 @@ class WorldScoreApp:
 
 	def _BuildOutputImagePath(self, WorldPath: pathlib.Path) -> pathlib.Path:
 		WorldName = SanitizePathPart(WorldPath.name.strip() or "world")
-		return self.OutputDir / WorldName / "poi_score_map.png"
+		return self.OutputDir / "poi_score_maps" / f"{WorldName}.png"
 
 	def _FilterScorePrefabs(self, Placements: list[PrefabPlacement]) -> tuple[list[PrefabPlacement], list[tuple[PrefabPlacement, str]]]:
 		MinTier = int(self.MinTier.get())
