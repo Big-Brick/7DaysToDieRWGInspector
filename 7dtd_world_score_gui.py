@@ -107,6 +107,15 @@ class WorldScoreApp:
 		self.PreviewImage: Image.Image | None = None
 		self.PreviewPhoto: ImageTk.PhotoImage | None = None
 		self.PreviewScale = 1.0
+		self.ViewScale = 1.0
+		self.ViewOffsetX = 0.0
+		self.ViewOffsetY = 0.0
+		self.CanvasImageItem = None
+		self.DragStartX = 0
+		self.DragStartY = 0
+		self.DragLastX = 0
+		self.DragLastY = 0
+		self.DragMoved = False
 
 		self.ScriptPath = pathlib.Path(__file__).resolve()
 		self.ScriptDir = self.ScriptPath.parent
@@ -167,7 +176,13 @@ class WorldScoreApp:
 		CanvasFrame.columnconfigure(0, weight=1)
 		self.Canvas = tkinter.Canvas(CanvasFrame, background="#202020", width=900, height=900, highlightthickness=0)
 		self.Canvas.grid(row=0, column=0, sticky="nsew")
-		self.Canvas.bind("<Button-1>", self._InspectCanvasPoint)
+		self.Canvas.bind("<ButtonPress-1>", self._StartMapDrag)
+		self.Canvas.bind("<B1-Motion>", self._DragMap)
+		self.Canvas.bind("<ButtonRelease-1>", self._EndMapDrag)
+		self.Canvas.bind("<MouseWheel>", self._ZoomMap)
+		self.Canvas.bind("<Button-4>", self._ZoomMap)
+		self.Canvas.bind("<Button-5>", self._ZoomMap)
+		self.Canvas.bind("<Configure>", self._ResizeMapView)
 		Paned.add(CanvasFrame, weight=4)
 
 		InfoFrame = tkinter.ttk.Frame(Paned)
@@ -344,13 +359,100 @@ class WorldScoreApp:
 			return
 		MaxSize = max(100, int(self.PreviewMaxSize.get()))
 		Scale = min(MaxSize / self.RenderImage.width, MaxSize / self.RenderImage.height, 1.0)
-		PreviewSize = (max(1, int(self.RenderImage.width * Scale)), max(1, int(self.RenderImage.height * Scale)))
 		self.PreviewScale = Scale
-		self.PreviewImage = self.RenderImage.resize(PreviewSize, Image.Resampling.LANCZOS)
-		self.PreviewPhoto = ImageTk.PhotoImage(self.PreviewImage)
+		self.ViewScale = Scale
+		self.ViewOffsetX = 0.0
+		self.ViewOffsetY = 0.0
 		self.Canvas.delete("all")
-		self.Canvas.config(width=PreviewSize[0], height=PreviewSize[1])
-		self.Canvas.create_image(0, 0, anchor="nw", image=self.PreviewPhoto)
+		self.CanvasImageItem = None
+		self._RenderCanvasImage()
+
+	def _RenderCanvasImage(self):
+		if self.RenderImage is None:
+			return
+		Scale = max(0.01, min(1.0, float(self.ViewScale)))
+		PreviewSize = (max(1, int(self.RenderImage.width * Scale)), max(1, int(self.RenderImage.height * Scale)))
+		self.ViewScale = Scale
+		self.PreviewScale = Scale
+		Resample = Image.Resampling.LANCZOS if Scale < 1.0 else Image.Resampling.NEAREST
+		self.PreviewImage = self.RenderImage.resize(PreviewSize, Resample)
+		self.PreviewPhoto = ImageTk.PhotoImage(self.PreviewImage)
+		self._ClampViewOffset(PreviewSize)
+		if self.CanvasImageItem is None:
+			self.CanvasImageItem = self.Canvas.create_image(self.ViewOffsetX, self.ViewOffsetY, anchor="nw", image=self.PreviewPhoto)
+		else:
+			self.Canvas.itemconfigure(self.CanvasImageItem, image=self.PreviewPhoto)
+			self.Canvas.coords(self.CanvasImageItem, self.ViewOffsetX, self.ViewOffsetY)
+		self.Canvas.configure(scrollregion=(self.ViewOffsetX, self.ViewOffsetY, self.ViewOffsetX + PreviewSize[0], self.ViewOffsetY + PreviewSize[1]))
+
+	def _ClampViewOffset(self, PreviewSize: tuple[int, int] | None = None):
+		if self.RenderImage is None:
+			return
+		if PreviewSize is None:
+			PreviewSize = (max(1, int(self.RenderImage.width * self.ViewScale)), max(1, int(self.RenderImage.height * self.ViewScale)))
+		CanvasWidth = max(1, self.Canvas.winfo_width())
+		CanvasHeight = max(1, self.Canvas.winfo_height())
+		ImageWidth, ImageHeight = PreviewSize
+		if ImageWidth <= CanvasWidth:
+			self.ViewOffsetX = (CanvasWidth - ImageWidth) / 2
+		else:
+			self.ViewOffsetX = min(0.0, max(CanvasWidth - ImageWidth, self.ViewOffsetX))
+		if ImageHeight <= CanvasHeight:
+			self.ViewOffsetY = (CanvasHeight - ImageHeight) / 2
+		else:
+			self.ViewOffsetY = min(0.0, max(CanvasHeight - ImageHeight, self.ViewOffsetY))
+
+	def _ResizeMapView(self, Event):
+		if self.RenderImage is None or self.CanvasImageItem is None:
+			return
+		self._ClampViewOffset()
+		self.Canvas.coords(self.CanvasImageItem, self.ViewOffsetX, self.ViewOffsetY)
+
+	def _ZoomMap(self, Event):
+		if self.RenderImage is None:
+			return "break"
+		if getattr(Event, "num", None) == 4 or getattr(Event, "delta", 0) > 0:
+			ZoomFactor = 1.25
+		else:
+			ZoomFactor = 0.8
+		OldScale = self.ViewScale
+		NewScale = max(0.02, min(1.0, OldScale * ZoomFactor))
+		if abs(NewScale - OldScale) < 0.000001:
+			return "break"
+		ImageX = (Event.x - self.ViewOffsetX) / OldScale
+		ImageY = (Event.y - self.ViewOffsetY) / OldScale
+		self.ViewScale = NewScale
+		self.ViewOffsetX = Event.x - ImageX * NewScale
+		self.ViewOffsetY = Event.y - ImageY * NewScale
+		self._RenderCanvasImage()
+		return "break"
+
+	def _StartMapDrag(self, Event):
+		self.DragStartX = self.DragLastX = Event.x
+		self.DragStartY = self.DragLastY = Event.y
+		self.DragMoved = False
+		self.Canvas.configure(cursor="fleur")
+
+	def _DragMap(self, Event):
+		if self.RenderImage is None:
+			return
+		DeltaX = Event.x - self.DragLastX
+		DeltaY = Event.y - self.DragLastY
+		if abs(Event.x - self.DragStartX) > 3 or abs(Event.y - self.DragStartY) > 3:
+			self.DragMoved = True
+		self.DragLastX = Event.x
+		self.DragLastY = Event.y
+		self.ViewOffsetX += DeltaX
+		self.ViewOffsetY += DeltaY
+		self._ClampViewOffset()
+		if self.CanvasImageItem is not None:
+			self.Canvas.coords(self.CanvasImageItem, self.ViewOffsetX, self.ViewOffsetY)
+
+	def _EndMapDrag(self, Event):
+		self.Canvas.configure(cursor="")
+		if not self.DragMoved:
+			self._InspectCanvasPoint(Event)
+
 
 	def _WriteSummary(self, OutputPath: pathlib.Path):
 		UnknownTierCount = sum(1 for P in self.Placements if P.Tier is None and not P.IsTrader and not IsExcludedPrefabName(P.Name))
@@ -384,8 +486,8 @@ class WorldScoreApp:
 	def _InspectCanvasPoint(self, Event):
 		if self.NormalizedScore is None or self.Score is None or self.Transform is None:
 			return
-		PixelX = int(Event.x / self.PreviewScale)
-		PixelY = int(Event.y / self.PreviewScale)
+		PixelX = int((Event.x - self.ViewOffsetX) / self.PreviewScale)
+		PixelY = int((Event.y - self.ViewOffsetY) / self.PreviewScale)
 		if not (0 <= PixelX < self.ImageWidth and 0 <= PixelY < self.ImageHeight):
 			return
 		WorldX, WorldZ = self.Transform.ToWorld(PixelX, PixelY, self.ImageWidth, self.ImageHeight)
