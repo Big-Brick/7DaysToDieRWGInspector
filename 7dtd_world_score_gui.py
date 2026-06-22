@@ -108,8 +108,10 @@ class WorldScoreApp:
 		self.PreviewScale = 1.0
 
 		self.ScriptPath = pathlib.Path(__file__).resolve()
-		self.SettingsPath = self.ScriptPath.with_name("settings.xml")
-		self.FilteredLogPath = self.ScriptPath.with_name("poi_filtered.log")
+		self.ScriptDir = self.ScriptPath.parent
+		self.OutputDir = self.ScriptDir / "outputs"
+		self.SettingsPath = self.ScriptDir / "settings.xml"
+		self.FilteredLogPath = self.OutputDir / "poi_filtered.log"
 
 		self._BuildGui()
 		self._LoadSettings()
@@ -277,6 +279,7 @@ class WorldScoreApp:
 			self.Placements = [P for P in Placements if P.InMap]
 			self.Traders = [P for P in self.Placements if P.IsTrader]
 			self.ScorePrefabs, FilteredPrefabs = self._FilterScorePrefabs(Placements)
+			self.OutputDir.mkdir(parents=True, exist_ok=True)
 			WriteFilteredPoiLog(self.FilteredLogPath, FilteredPrefabs)
 			self._SaveSettings()
 
@@ -302,7 +305,8 @@ class WorldScoreApp:
 				int(self.BiomeBoundaryWidth.get()),
 			)
 
-			OutputPath = WorldPath / "poi_score_map.png"
+			OutputPath = self._BuildOutputImagePath(WorldPath)
+			OutputPath.parent.mkdir(parents=True, exist_ok=True)
 			self.RenderImage.save(OutputPath)
 			self._ShowPreview()
 			self._WriteSummary(OutputPath)
@@ -310,6 +314,11 @@ class WorldScoreApp:
 		except Exception as Error:
 			tkinter.messagebox.showerror("7DTD world POI score map", str(Error), parent=self.Root)
 			self._SetStatus(f"Error: {Error}")
+
+
+	def _BuildOutputImagePath(self, WorldPath: pathlib.Path) -> pathlib.Path:
+		WorldName = SanitizePathPart(WorldPath.name.strip() or "world")
+		return self.OutputDir / WorldName / "poi_score_map.png"
 
 	def _FilterScorePrefabs(self, Placements: list[PrefabPlacement]) -> tuple[list[PrefabPlacement], list[tuple[PrefabPlacement, str]]]:
 		MinTier = int(self.MinTier.get())
@@ -417,6 +426,10 @@ class WorldScoreApp:
 				Text.append(f"  ... {len(PrefabContribs) - 40} more\n")
 		self._SetInfoText("".join(Text))
 
+
+def SanitizePathPart(Text: str) -> str:
+	SafeText = re.sub(r"[^A-Za-z0-9._-]+", "_", Text).strip("._-")
+	return SafeText or "world"
 
 def ParseWorldPrefabs(PrefabsXmlPath: pathlib.Path) -> list[PrefabPlacement]:
 	Root = xml.etree.ElementTree.parse(PrefabsXmlPath).getroot()
