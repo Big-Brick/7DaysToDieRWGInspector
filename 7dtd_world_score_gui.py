@@ -45,6 +45,7 @@ class CoordinateTransform:
 	Name: str
 	ToPixel: object
 	ToWorld: object
+	PixelsPerWorldUnit: float = 1.0
 
 
 KNOWN_BIOME_COLORS = [
@@ -267,7 +268,11 @@ class WorldScoreApp:
 			ApplyPrefabTiers(Placements, PrefabTierIndex)
 
 			self._SetStatus("Choosing coordinate transform...")
-			self.Transform = ChooseBestCoordinateTransform(Placements, self.ImageWidth, self.ImageHeight)
+			# Determine the generated world dimensions separately from the biome image size.
+			# Some 7DTD maps ship a scaled biomes.png (for example 1280 px for an
+			# 8192 m world), while prefabs.xml always stores world-meter coordinates.
+			WorldWidth, WorldHeight = GetGeneratedWorldSize(WorldPath, Placements, self.ImageWidth, self.ImageHeight)
+			self.Transform = ChooseBestCoordinateTransform(Placements, self.ImageWidth, self.ImageHeight, WorldWidth, WorldHeight)
 			for Placement in Placements:
 				PixelX, PixelY = self.Transform.ToPixel(Placement.WorldX, Placement.WorldZ, self.ImageWidth, self.ImageHeight)
 				Placement.PixelX = int(round(PixelX))
@@ -289,6 +294,7 @@ class WorldScoreApp:
 				float(self.TraderDistanceCoefficient.get()),
 				float(self.MaxTraderDist.get()),
 				float(self.MaxDistCoeff.get()),
+				self.Transform.PixelsPerWorldUnit if self.Transform else 1.0,
 				self._SetStatus,
 			)
 			self.NormalizedScore = NormalizeScore(self.Score)
@@ -379,7 +385,7 @@ class WorldScoreApp:
 		NearestTrader = None
 		NearestTraderDistance = None
 		for Trader in self.Traders:
-			Distance = math.hypot(PixelX - Trader.PixelX, PixelY - Trader.PixelY)
+			Distance = math.hypot(PixelX - Trader.PixelX, PixelY - Trader.PixelY) / max(self.Transform.PixelsPerWorldUnit, 0.000001)
 			if NearestTraderDistance is None or Distance < NearestTraderDistance:
 				NearestTraderDistance = Distance
 				NearestTrader = Trader
@@ -394,7 +400,7 @@ class WorldScoreApp:
 		PrefabContribs = []
 		MaxDist = float(self.MaxDistCoeff.get())
 		for Prefab in self.ScorePrefabs:
-			Distance = math.hypot(PixelX - Prefab.PixelX, PixelY - Prefab.PixelY)
+			Distance = math.hypot(PixelX - Prefab.PixelX, PixelY - Prefab.PixelY) / max(self.Transform.PixelsPerWorldUnit, 0.000001)
 			Contribution = max(0.0, MaxDist - Distance)
 			if Contribution > 0.0:
 				PrefabContribs.append((Contribution, Distance, Prefab))
@@ -613,27 +619,78 @@ def ApplyPrefabTiers(Placements: list[PrefabPlacement], PrefabTierIndex: dict[st
 				break
 
 
-def ChooseBestCoordinateTransform(Placements: list[PrefabPlacement], Width: int, Height: int) -> CoordinateTransform:
+def GetGeneratedWorldSize(WorldPath: pathlib.Path, Placements: list[PrefabPlacement], ImageWidth: int, ImageHeight: int) -> tuple[float, float]:
+	MapInfoPath = WorldPath / "map_info.xml"
+	WorldSize = ParseWorldSizeFromMapInfo(MapInfoPath)
+	if WorldSize is not None:
+		return WorldSize
+
+	MaxAbsX = max((abs(Placement.WorldX) for Placement in Placements), default=ImageWidth / 2.0)
+	MaxAbsZ = max((abs(Placement.WorldZ) for Placement in Placements), default=ImageHeight / 2.0)
+	NeededSize = max(MaxAbsX * 2.0, MaxAbsZ * 2.0, float(ImageWidth), float(ImageHeight))
+	CommonSizes = [1024, 2048, 4096, 6144, 8192, 10240, 12288, 16384]
+	for Size in CommonSizes:
+		if Size >= NeededSize:
+			return float(Size), float(Size)
+	return float(math.ceil(NeededSize)), float(math.ceil(NeededSize))
+
+
+def ParseWorldSizeFromMapInfo(MapInfoPath: pathlib.Path) -> tuple[float, float] | None:
+	try:
+		Root = xml.etree.ElementTree.parse(MapInfoPath).getroot()
+	except (FileNotFoundError, xml.etree.ElementTree.ParseError, OSError):
+		return None
+
+	Values: dict[str, str] = {}
+	for Element in Root.iter():
+		Attrs = {str(Key).lower(): str(Value) for Key, Value in Element.attrib.items()}
+		Name = Attrs.get("name", "").lower().replace("_", "")
+		Value = Attrs.get("value")
+		if Name and Value is not None:
+			Values[Name] = Value
+		for Key, Value in Attrs.items():
+			Values[Key.lower().replace("_", "")] = Value
+
+	Size = ParseIntFromText(Values.get("worldgensize") or Values.get("worldsize") or Values.get("size"))
+	if Size is not None and Size > 0:
+		return float(Size), float(Size)
+
+	Width = ParseIntFromText(Values.get("width") or Values.get("mapwidth"))
+	Height = ParseIntFromText(Values.get("height") or Values.get("mapheight"))
+	if Width is not None and Height is not None and Width > 0 and Height > 0:
+		return float(Width), float(Height)
+	return None
+
+
+def ChooseBestCoordinateTransform(Placements: list[PrefabPlacement], Width: int, Height: int, WorldWidth: float | None = None, WorldHeight: float | None = None) -> CoordinateTransform:
+	WorldWidth = float(WorldWidth or Width)
+	WorldHeight = float(WorldHeight or Height)
+	ScaleX = Width / WorldWidth
+	ScaleY = Height / WorldHeight
 	Transforms = [
 		CoordinateTransform(
-			"center origin, image north up: px=x+W/2, py=H/2-z",
-			lambda X, Z, W, H: (X + W / 2.0, H / 2.0 - Z),
-			lambda PX, PY, W, H: (PX - W / 2.0, H / 2.0 - PY),
+			f"center origin, image north up: px=(x+{WorldWidth:g}/2)*{ScaleX:g}, py=({WorldHeight:g}/2-z)*{ScaleY:g}",
+			lambda X, Z, W, H, WW=WorldWidth, WH=WorldHeight: ((X + WW / 2.0) * W / WW, (WH / 2.0 - Z) * H / WH),
+			lambda PX, PY, W, H, WW=WorldWidth, WH=WorldHeight: (PX * WW / W - WW / 2.0, WH / 2.0 - PY * WH / H),
+			(ScaleX + ScaleY) / 2.0,
 		),
 		CoordinateTransform(
-			"center origin, image south up: px=x+W/2, py=z+H/2",
-			lambda X, Z, W, H: (X + W / 2.0, Z + H / 2.0),
-			lambda PX, PY, W, H: (PX - W / 2.0, PY - H / 2.0),
+			f"center origin, image south up: px=(x+{WorldWidth:g}/2)*{ScaleX:g}, py=(z+{WorldHeight:g}/2)*{ScaleY:g}",
+			lambda X, Z, W, H, WW=WorldWidth, WH=WorldHeight: ((X + WW / 2.0) * W / WW, (Z + WH / 2.0) * H / WH),
+			lambda PX, PY, W, H, WW=WorldWidth, WH=WorldHeight: (PX * WW / W - WW / 2.0, PY * WH / H - WH / 2.0),
+			(ScaleX + ScaleY) / 2.0,
 		),
 		CoordinateTransform(
-			"raw origin, image north up: px=x, py=H-z",
-			lambda X, Z, W, H: (X, H - Z),
-			lambda PX, PY, W, H: (PX, H - PY),
+			f"raw origin, image north up: px=x*{ScaleX:g}, py=({WorldHeight:g}-z)*{ScaleY:g}",
+			lambda X, Z, W, H, WW=WorldWidth, WH=WorldHeight: (X * W / WW, (WH - Z) * H / WH),
+			lambda PX, PY, W, H, WW=WorldWidth, WH=WorldHeight: (PX * WW / W, WH - PY * WH / H),
+			(ScaleX + ScaleY) / 2.0,
 		),
 		CoordinateTransform(
-			"raw origin, image south up: px=x, py=z",
-			lambda X, Z, W, H: (X, Z),
-			lambda PX, PY, W, H: (PX, PY),
+			f"raw origin, image south up: px=x*{ScaleX:g}, py=z*{ScaleY:g}",
+			lambda X, Z, W, H, WW=WorldWidth, WH=WorldHeight: (X * W / WW, Z * H / WH),
+			lambda PX, PY, W, H, WW=WorldWidth, WH=WorldHeight: (PX * WW / W, PY * WH / H),
+			(ScaleX + ScaleY) / 2.0,
 		),
 	]
 
@@ -659,17 +716,17 @@ def ComputeScoreMap(
 	TraderDistanceCoefficient: float,
 	MaxTraderDist: float,
 	MaxDistCoeff: float,
+	PixelsPerWorldUnit: float = 1.0,
 	StatusCallback=None,
 ) -> numpy.ndarray:
 	Score = numpy.zeros((Height, Width), dtype=numpy.float32)
 
 	if Traders and MaxTraderDist > 0.0 and TraderDistanceCoefficient != 0.0:
 		TraderScore = numpy.zeros((Height, Width), dtype=numpy.float32)
-		Radius = int(math.ceil(MaxTraderDist))
 		for Index, Trader in enumerate(Traders):
 			if StatusCallback is not None:
 				StatusCallback(f"Computing trader distance field {Index + 1}/{len(Traders)}...")
-			Contribution = ComputeRadialContribution(Width, Height, Trader.PixelX, Trader.PixelY, MaxTraderDist)
+			Contribution = ComputeRadialContribution(Width, Height, Trader.PixelX, Trader.PixelY, MaxTraderDist, PixelsPerWorldUnit)
 			if Contribution is not None:
 				X0, Y0, Values = Contribution
 				Y1 = Y0 + Values.shape[0]
@@ -681,7 +738,7 @@ def ComputeScoreMap(
 		for Index, Prefab in enumerate(ScorePrefabs):
 			if StatusCallback is not None and (Index % 5 == 0 or Index + 1 == len(ScorePrefabs)):
 				StatusCallback(f"Computing POI fields {Index + 1}/{len(ScorePrefabs)}...")
-			Contribution = ComputeRadialContribution(Width, Height, Prefab.PixelX, Prefab.PixelY, MaxDistCoeff)
+			Contribution = ComputeRadialContribution(Width, Height, Prefab.PixelX, Prefab.PixelY, MaxDistCoeff, PixelsPerWorldUnit)
 			if Contribution is not None:
 				X0, Y0, Values = Contribution
 				Y1 = Y0 + Values.shape[0]
@@ -690,8 +747,9 @@ def ComputeScoreMap(
 	return Score
 
 
-def ComputeRadialContribution(Width: int, Height: int, CenterX: int, CenterY: int, RadiusFloat: float):
-	Radius = int(math.ceil(RadiusFloat))
+def ComputeRadialContribution(Width: int, Height: int, CenterX: int, CenterY: int, RadiusFloat: float, PixelsPerWorldUnit: float = 1.0):
+	PixelsPerWorldUnit = max(float(PixelsPerWorldUnit), 0.000001)
+	Radius = int(math.ceil(RadiusFloat * PixelsPerWorldUnit))
 	X0 = max(0, CenterX - Radius)
 	X1 = min(Width, CenterX + Radius + 1)
 	Y0 = max(0, CenterY - Radius)
@@ -701,7 +759,8 @@ def ComputeRadialContribution(Width: int, Height: int, CenterX: int, CenterY: in
 	Y = numpy.arange(Y0, Y1, dtype=numpy.float32)[:, None]
 	X = numpy.arange(X0, X1, dtype=numpy.float32)[None, :]
 	Distance = numpy.sqrt((X - numpy.float32(CenterX)) ** 2 + (Y - numpy.float32(CenterY)) ** 2)
-	Values = numpy.maximum(numpy.float32(0.0), numpy.float32(RadiusFloat) - Distance).astype(numpy.float32, copy=False)
+	WorldDistance = Distance / numpy.float32(PixelsPerWorldUnit)
+	Values = numpy.maximum(numpy.float32(0.0), numpy.float32(RadiusFloat) - WorldDistance).astype(numpy.float32, copy=False)
 	return X0, Y0, Values
 
 
