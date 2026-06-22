@@ -107,7 +107,9 @@ class WorldScoreApp:
 		self.PreviewPhoto: ImageTk.PhotoImage | None = None
 		self.PreviewScale = 1.0
 
-		self.SettingsPath = pathlib.Path(__file__).resolve().with_name("settings.xml")
+		self.ScriptPath = pathlib.Path(__file__).resolve()
+		self.SettingsPath = self.ScriptPath.with_name("settings.xml")
+		self.FilteredLogPath = self.ScriptPath.with_name("poi_filtered.log")
 
 		self._BuildGui()
 		self._LoadSettings()
@@ -275,8 +277,7 @@ class WorldScoreApp:
 			self.Placements = [P for P in Placements if P.InMap]
 			self.Traders = [P for P in self.Placements if P.IsTrader]
 			self.ScorePrefabs, FilteredPrefabs = self._FilterScorePrefabs(Placements)
-			FilteredLogPath = WorldPath / "poi_filtered.log"
-			WriteFilteredPoiLog(FilteredLogPath, FilteredPrefabs)
+			WriteFilteredPoiLog(self.FilteredLogPath, FilteredPrefabs)
 			self._SaveSettings()
 
 			self._SetStatus("Computing score heatmap...")
